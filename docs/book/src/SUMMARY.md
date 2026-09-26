@@ -78,6 +78,7 @@
   - [Filesystem components](./agents/filesystem.md)
   - [Running agents](./agents/operating.md)
   - [Multi-agent setup](./agents/multi-agent-setup.md)
+  - [Agent portability](./agents/portability.md)
   - [Delegation & SubAgents](./agents/delegation.md)
   - [Runtime internals](./agents/internals.md)
   - [History management](./agents/history-management.md)
