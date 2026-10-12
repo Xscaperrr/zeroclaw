@@ -7,8 +7,7 @@ use std::time::Duration;
 use wasmtime::component::{Component, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_http::WasiHttpCtx;
-use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::config::ResolvedPluginConfig;
 use crate::egress::{AuthorizedEgress, EgressError, EgressHostService, build_tls_client_config};
@@ -580,7 +579,7 @@ impl WasiView for PluginState {
 
 impl WasiHttpView for PluginState {
     /// Hand `wasi:http` ZeroClaw's policy hooks instead of
-    /// `wasmtime_wasi_http::p2::default_hooks()`. The default hooks send every
+    /// `wasmtime_wasi_http::default_hooks()`. The default hooks send every
     /// request the guest asks for; these submit it to the host-owned egress
     /// boundary first and own the connect (see [`crate::wasi_http`]).
     fn http(&mut self) -> WasiHttpCtxView<'_> {
@@ -866,12 +865,24 @@ macro_rules! call_tool_execute {
 }
 pub(crate) use call_tool_execute;
 
-/// Warm channel calls reinstantiate from host-owned inputs when the previous
-/// call was interrupted and discarded, then run under the same
-/// discard-on-interruption rule as other warm instances, inside the
-/// channel-service frame.
+/// Run one warm channel export inside the channel-service frame, bounded by
+/// the wall-clock deadline, first rebuilding the instance from host-owned
+/// inputs when an earlier call discarded it.
+///
+/// `$body` returns the export's own Wasmtime result. `Err` means the call
+/// failed inside Wasmtime: a guest trap, exhausted fuel, a failed host import,
+/// or a result that could not be lifted. Wasmtime refuses every later call
+/// into such a store, so the instance is discarded, as it is after a missed
+/// deadline, and the error is reported with `$context`. An error the export
+/// itself returns arrives inside `Ok`, and the instance goes back to its slot.
+///
+/// Both kinds of discard count against the channel's rebuild budget, so a
+/// hung export cannot reconnect the plugin at every deadline. The
+/// `waits_on_person` form leaves missed deadlines out, for an export that
+/// waits for a person to answer, such as an approval prompt: a slow answer
+/// is not a broken plugin.
 macro_rules! call_channel {
-    ($self:expr, $body:expr) => {{
+    (@call $self:expr, $count_missed_deadline:expr, $context:expr, $body:expr) => {{
         'plugin_call: {
             let mut guard = $self.state.lock().await;
             if guard.is_none() {
@@ -886,19 +897,32 @@ macro_rules! call_channel {
             let deadline = store.data().call_timeout();
             let mut active_call = crate::component::ActivePluginCall::channel_service(&mut store);
             let f = $body;
-            match ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings)).await
-            {
-                Ok(result) => {
-                    drop(active_call);
+            let outcome =
+                ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings)).await;
+            drop(active_call);
+            match outcome {
+                Ok(Ok(value)) => {
                     *guard = Some((store, bindings));
-                    break 'plugin_call result;
+                    Ok(value)
+                }
+                Ok(Err(error)) => {
+                    $self.instance_failed();
+                    crate::component::wt(Err(error), $context)
                 }
                 Err(_) => {
-                    drop(active_call);
-                    break 'plugin_call Err(crate::component::call_timeout_error(deadline));
+                    if $count_missed_deadline {
+                        $self.instance_failed();
+                    }
+                    Err(crate::component::call_timeout_error(deadline))
                 }
             }
         }
+    }};
+    ($self:expr, waits_on_person, $context:expr, $body:expr) => {{
+        crate::component::call_channel!(@call $self, false, $context, $body)
+    }};
+    ($self:expr, $context:expr, $body:expr) => {{
+        crate::component::call_channel!(@call $self, true, $context, $body)
     }};
 }
 pub(crate) use call_channel;
@@ -970,6 +994,7 @@ mod tests {
             wasm_path: Some("fixture.wasm".to_string()),
             wasm_sha256: None,
             capabilities: vec![capability],
+            provides: None,
             permissions: vec![PluginPermission::ConfigRead],
             config_schema: Some(serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
