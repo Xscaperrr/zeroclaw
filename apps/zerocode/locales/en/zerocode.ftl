@@ -20,6 +20,21 @@ zc-app-help-toggle-sidebar = Toggle agent sidebar
 zc-app-help-quit = Quit
 
 zc-sidebar-title = Agents
+zc-dock-header = Dock { $side }
+zc-dock-side-left = left
+zc-dock-side-right = right
+zc-dock-switch-side = [↔]
+zc-dock-setting-sessions = Sessions visibility
+zc-dock-setting-side = Dock side
+zc-dock-setting-width = Dock width
+zc-dock-setting-split = Dock section split
+zc-dock-save-env-shadow = { $setting } changed, but an environment override will take effect after relaunch.
+zc-dock-save-failed = { $setting } changed for this run, but could not be saved: { $error }
+zc-dock-toggle-sessions = Sessions
+zc-dock-toggle-queue = Queue
+zc-dock-toggle-plan = Plan
+zc-todo-plan-title = Plan ({ $total }) — { $done }/{ $total } done
+zc-todo-plan-empty = No active plan
 zc-sidebar-empty = No active agents
 zc-sidebar-picker-title = Add agent
 zc-sidebar-picker-loading = Loading agents…
@@ -159,6 +174,7 @@ zc-queue-full = Queue is full ({ $cap } max). Wait for messages to send.
 zc-queue-title = Queue ({ $count })
 zc-queue-empty-list = No queued messages.
 zc-queue-paused-ghost = Queue paused — press { $key } or send a message to resume
+zc-queue-missing-completion-ghost = Completion unconfirmed. { $key } or send to resume.
 zc-queue-item-injected = (inject)
 zc-queue-resumed = Queue resumed.
 zc-queue-clear-empty = Queue is already empty.
@@ -170,7 +186,6 @@ zc-queue-help-nav = Select queued
 zc-queue-help-delete = Delete queued
 zc-queue-help-clear = Clear queue ([N] = position)
 zc-queue-help-edit = Edit queued
-zc-queue-help-resize = Resize queue
 zc-queue-help-enqueue = Queue message
 zc-queue-help-inject = Send now (skip queue)
 zc-queue-edit-busy = Finish or clear the current message before editing a queued one.
@@ -483,10 +498,16 @@ zc-chat-resume-dropped = { $count } prior session(s) could not be re-attached an
 zc-chat-reconnect-interrupted = The connection was rebuilt and queued messages were preserved. Waiting for the prior turn to stop before reloading the durable transcript.
 zc-chat-resyncing = Some live updates were missed. Reloading this session before sending queued messages…
 zc-chat-resynced = Live updates were missed, so the durable transcript was reloaded. Any in-progress approval or question was cancelled.
+zc-chat-resynced-turn-running = Live updates were missed. The in-progress turn is still running; output shown above was kept, and the durable transcript will be reloaded when the turn finishes.
+zc-chat-resynced-turn-finished = The in-progress turn finished, so the durable transcript was reloaded once more.
 zc-chat-resync-failed = Live updates were missed and the session could not be reloaded: { $error }
 zc-chat-session-restart-error = Failed to start a new session: { $error }
-zc-chat-code-cwd-unavailable = Cannot determine the directory zerocode was launched from: { $error }. A local Code session must start in that project, so it was not created.
-zc-chat-code-cwd-not-utf8 = The directory zerocode was launched from is not valid UTF-8 ({ $path }), so a local Code session cannot start there. Relaunch zerocode from a UTF-8 path.
+zc-chat-code-cwd-not-utf8 = The selected directory is not valid UTF-8 ({ $path }), so the Code session was not created. Pick a directory whose path is valid UTF-8.
+zc-chat-code-cwd-not-absolute = The selected directory is not an absolute path ({ $path }), so the new Code session was not created. Pick a directory from the root of the filesystem the session runs on.
+zc-chat-launch-cwd-unavailable = Cannot determine the directory zerocode was launched from: { $error }. A local session must start in that project, so it was not created.
+zc-chat-launch-cwd-not-utf8 = The directory zerocode was launched from is not valid UTF-8 ({ $path }), so a local session cannot start there. Relaunch zerocode from a UTF-8 path.
+zc-chat-change-directory-error = Failed to start a session in the selected directory: { $error }
+zc-chat-change-directory-chat-only = Chat sessions keep the directory they started in, so there is no directory to choose here. Use the Code pane to start a session in a different directory.
 
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
@@ -534,6 +555,7 @@ zc-chat-help-scroll-conversation = Scroll conversation
 zc-chat-help-open-link = Click a link to open it; drag from elsewhere to select text
 zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-new-session = New session
+zc-chat-help-change-directory = Choose a directory and start a new Code session
 zc-chat-help-acp-memory = History saved & resumable; persistent memory isolated
 zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
 zc-chat-session-list-resume-note = Session history saved & resumable · Persistent memory isolated
@@ -560,6 +582,7 @@ zc-chat-context-menu-copy-selection = Copy selection
 zc-chat-context-menu-open-link = Open link
 zc-chat-context-menu-copy-link = Copy link
 zc-chat-open-link-failed = Could not open link: { $error }
+zc-chat-context-menu-add-to-chat = Add to Chat
 zc-chat-context-menu-send-now = Send now
 zc-chat-context-menu-edit = Edit
 zc-chat-context-menu-delete = Delete
@@ -567,6 +590,13 @@ zc-chat-tool-show-all = [Show all · { $count } more lines]
 zc-chat-tool-show-less = [Show less]
 zc-chat-tool-display-limited = [Display limited; copy for full content]
 zc-chat-tool-encoded-size = { $count } encoded characters
+zc-chat-tool-subagent = Subagent
+zc-chat-tool-delegation = Delegation
+zc-chat-tool-task = Task
+zc-chat-tool-target = Target
+zc-chat-tool-response = Response
+zc-chat-tool-details = Details
+zc-chat-tool-result-not-recorded = Result not recorded
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
@@ -664,6 +694,11 @@ zc-config-footer-action-new-line = new line
 zc-config-field-edit-hint = { $keys } → press to edit
 
 zc-doctor-log-path = log: { $path }
+
+zc-oidc-enroll-visit = To sign in, visit { $uri } and enter code { $code }
+zc-oidc-enroll-waiting = Waiting for identity-provider approval (the code expires in { $seconds } seconds)...
+zc-oidc-enroll-missing-url = auth_provider { $provider } is set with no auth_token. Set [connection.wss] enroll_url to the gateway's HTTP origin to sign in interactively, or export ZEROCLAW_AUTH_TOKEN (see: zeroclaw oidc login).
+zc-oidc-enroll-done = Signed in. The token is held for this session only; export ZEROCLAW_AUTH_TOKEN to skip enrollment next time.
 
 ## Config registry metadata. Stable identifiers are used for lookup while the
 ## RPC-provided English display strings remain compatibility fallbacks.

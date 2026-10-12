@@ -27,7 +27,10 @@ importantly, what changes for existing remote connections.
    - `session/new` and `session/prompt` check the agent selector and hold
      the session's workspace to a directory that agent's policy lets it both
      read and write, whether the workspace was named by the request, stored
-     with a resumed session, or restored from a durable one. The other
+     with a resumed session, or restored from a durable one. The session is
+     bound to the resolved directory, not the requested spelling, so
+     retargeting a symlinked cwd after admission does not move it, and a
+     live session held under such an alias is refused. The other
      session methods do not check the agent yet, as described under
      [What this layer does not do (yet)](#what-this-layer-does-not-do-yet);
    - running or approving an SOP requires every agent it runs as, with the
@@ -124,6 +127,19 @@ operator, or a roster principal with `admin = true`) on a local connection.
 Every other principal, and every remote connection, gets the daemon's own
 environment instead.
 
+Eligibility is checked again when a session is built or restored. An existing
+session that retains a non-empty forwarded environment can be resumed or
+prompted only by a currently authorized local operator. Reconnecting over WSS,
+or losing `admin` while a prompt is queued, does not carry that environment into
+the next turn: the request is refused before execution. Create a new session to
+continue without the forwarded environment. Sessions without forwarded values
+remain eligible for normal resume, subject to the other authorization checks.
+The retained environment is immutable for the lifetime of its session; refusing
+a later request does not rewrite it underneath an already running turn. A
+resume also requires the current connection's authorized environment to match
+the session's retained environment. If it differs, create a new session; an
+environment-free session can still be resumed after `admin` is removed.
+
 #### Recovery
 
 A remote authentication bypass is never offered: a remote connection always
@@ -177,6 +193,151 @@ token verification (offline JWKS or RFC 7662 introspection), claim
 mapping, and the lifetime bounds are documented on the section reference:
 
 {{#config-fields oidc}}
+
+#### Enrolling (getting a token to present)
+
+The daemon only verifies tokens; clients obtain them from the IdP. Two
+browserless flows ship with the CLI:
+
+```sh
+# Interactive sign-in via the Device Authorization Grant (RFC 8628):
+# prints a verification code to enter in any browser, waits for
+# approval, then writes the access token to stdout.
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp)"
+
+# Same, via the system browser: Authorization Code + PKCE (S256 only)
+# with an RFC 8252 one-shot loopback listener. The mechanisms never
+# fall back into each other.
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp --browser)"
+
+# Headless service principals via client_credentials (requires the
+# entry's client_secret):
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc token corp)"
+```
+
+Progress messages go to stderr; stdout carries only the token, so both
+commands compose with command substitution (the `oidc` commands run before
+any startup prelude that could print, the OTP seed disclosure included).
+Nothing is stored: present the token as `auth_token` in the RPC handshake
+(or via the environment variable) before it expires, then re-enroll.
+
+The client trusts the issuer the entry names and nothing else: the
+discovery document must assert exactly that issuer before any endpoint it
+advertises is used, every endpoint that receives a credential must satisfy
+the same URL policy as the issuer (`https`, or `http` only for an exact
+loopback host), redirects are never followed, response bodies are
+size-capped, and a token response is accepted only when it carries a
+non-empty `Bearer` access token. A confidential client (an entry with a
+`client_secret`) authenticates with HTTP Basic on every request; a public
+client sends its `client_id` in the form.
+
+`--browser` opens the system browser for you on macOS and Linux, and on
+every platform it also prints the sign-in URL so you can open it by
+hand in a browser on the same machine (the callback lands on a loopback
+port of the host running the CLI). The browser opener runs detached
+from the CLI's standard streams, so whatever a launcher writes on its
+own stdout cannot contaminate the result: stdout still carries only the
+token.
+
+Both callback adapters, the CLI's loopback listener and the gateway
+callback, enforce the RFC 9207 issuer check. A response whose `iss`
+parameter does not match the issuer that started the flow is refused
+before its `code` or its `error` is acted on. A response that carries no
+`iss` at all is accepted, since the parameter is optional and not every
+issuer sends it. When the code exchange returns an `id_token` next to
+the access token, that `id_token` is validated in full (issuer,
+audience, expiry, and the nonce bound to this flow) and then discarded.
+Only the access token is ever presented to the daemon. The enrollment
+client applies the same suspicion to discovery itself: it refuses a
+`.well-known/openid-configuration` document whose `issuer` is not an
+exact match for the configured issuer, trailing slash included, before
+it uses any endpoint named in it (the RFC 8414 check), and it caps the
+size of the documents it reads, so a hostile or broken issuer cannot
+redirect the flow to endpoints of its choosing or answer with an
+unbounded body.
+
+Clients that hold no IdP credentials (the web dashboard, zerocode)
+enroll through the gateway instead, which proxies the same flows with
+the configured entry's client credentials: `GET /api/oidc/providers`
+lists aliases, `POST /api/oidc/{alias}/device/start` and
+`/device/poll` drive the device grant, and `GET /oidc/login/{alias}`
+runs the browser flow, whose one-time callback page hands the token to
+the opening window via `postMessage` (same-origin only) with a manual
+copy fallback. The gateway also sends
+`Cross-Origin-Opener-Policy: same-origin`, which severs `window.opener`
+once the popup has navigated through the identity provider, so in
+current browsers the manual copy on that page is the handoff that works
+today and the `postMessage` contract is in place for the dashboard
+follow-up. These routes are unauthenticated by necessity
+(enrollment precedes authentication), rate limited, and grant nothing:
+they only relay what the IdP grants after the user approves. Design
+rationale and failure-mode table:
+`docs/security/oidc-browser-pkce-design-8289.md` in the repository.
+
+The rate limiting works in layers. Requests that start a flow
+(`POST /api/oidc/{alias}/device/start`, `GET /oidc/login/{alias}`, and
+`GET /oidc/callback`) count against an enrollment-specific instance of
+the gateway's brute-force limiter: the same thresholds and the same
+lockout that govern a bad pairing token, kept on their own ledger, so
+an address locked out of enrollment can still pair or present a webhook
+signature, and a lockout earned on either of those never blocks
+enrollment. A callback counts as an attempt only when it is
+unproductive: no live flow state for the `state` it carries, an issuer
+that does not match, an error handed back by the identity provider, no
+authorization code, an alias removed while the flow was in flight, or a
+code exchange that fails. A callback that completes a sign-in costs
+nothing, and neither does one the gateway itself turns away because its
+relay capacity is in use, so a crowd of people signing in at once cannot
+lock their shared address out. A browser sign-in that is refused because
+the pending-flow store is full costs the caller nothing either, for the
+same reason. Provider listings, device polls and sign-in starts carry a
+per-client budget of 20 requests per minute, which leaves headroom over
+RFC 8628's five-second minimum polling interval (12 polls per minute)
+without letting a client spin. A poll counts as an attempt when the
+identity provider answers `slow_down` or rejects the device code
+outright, so a client relaying garbage device codes walks into the
+existing lockout instead of polling forever; a transport failure on the
+gateway's own leg to the identity provider says nothing about the
+caller and is not billed to it. A client over its budget, or locked
+out, gets HTTP 429 with a `Retry-After` naming the delay in seconds,
+and zerocode waits at least that delay, and never less than the RFC's
+five-second increment, before its next poll (still clipped to the device
+code's remaining lifetime), and never polls faster than once every five
+seconds in any case. At most 16 outbound relays to the identity
+provider are in flight at once across all clients, which bounds what the
+gateway will do to the IdP on everyone's behalf. The pending-flow store
+holds 32 browser sign-ins at once, and one remote client may hold eight of
+them, so a caller that starts sign-ins and never finishes them cannot take
+the store away from everyone else for the ten minutes those flows live. Loopback clients are
+exempt from the per-client budgets, as they are from every other gateway
+auth limit, so a reverse proxy sitting on the same host must enable
+`trust_forwarded_headers` for the per-client limits to apply to the real
+callers behind it. Every enrollment response carries
+`Cache-Control: no-store` and `Pragma: no-cache` on top of the gateway's
+`no-referrer` policy, because device codes and access tokens travel in
+those bodies.
+
+zerocode enrolls over the same API from its own config.
+`[connection.wss] enroll_url` names the gateway's HTTP origin, and an
+optional path prefix is allowed. It must be `https://` unless it points
+at a loopback address (`127.0.0.1`, `::1`, or `localhost`), because the
+device code and then the access token travel over it, and redirects are
+not followed, so a plaintext hop cannot be introduced after the fact.
+The enrollment connection uses the same `[connection.wss.tls]` trust
+material as the WSS leg: the configured CA, `skip_verify`, and the
+mutual-TLS client certificate. When that material leaves the certificate
+unchecked, zerocode asks before the device code goes out rather than
+after the token has arrived, and it asks about the enrollment origin
+itself, which may not be the daemon the session connects to afterwards.
+Answering `always` records that origin in `skip_verify_routes`; a
+non-interactive run has nobody to ask, so enrollment stops there. zerocode clips every polling wait to the
+device code's remaining lifetime and never polls after it expires, and
+it refuses an advertised lifetime above one hour or a polling interval
+above five minutes rather than sleeping on a hostile answer. An
+advertised interval of `0` or `1` is floored at RFC 8628's five-second
+default, so a gateway answer cannot put zerocode on a once-a-second
+poll the per-client budget would only refuse. The token it receives is
+held in memory for that session only.
 
 ## Permission profiles
 
@@ -293,6 +454,62 @@ Migration for existing remote zerocode users:
 
 An OIDC access token works the same way with `auth_provider = "oidc.<alias>"`.
 
+## The gateway HTTP API
+
+The gateway's configuration and onboarding routes (`/api/config*`,
+`/api/quickstart/*`, `/api/channels/bind`) enforce authentication
+structurally: one route-layer middleware guards the whole group, so no
+individual handler carries (or can forget) a check. The middleware
+speaks the same principal model as the RPC path, through the same
+provider registry and resolver:
+
+- A **paired bearer** (`Authorization: Bearer zc_...`) resolves to the
+  shared operator with full access, exactly as before. Denials keep the
+  historical 401 shape.
+- An **OIDC bearer** presented with the `X-ZeroClaw-Auth-Provider:
+  oidc.<alias>` header is verified by that provider and resolved to a
+  scoped principal. Selection is explicit, mirroring the RPC
+  handshake's `auth_provider` field: the named provider's denial is
+  authoritative, and there is never a fallback between providers.
+- CORS preflight (`OPTIONS`) passes through unauthenticated, as it
+  always has. Any other method outside GET, HEAD, POST, PUT, PATCH and
+  DELETE is refused.
+
+A scoped principal's `Config` grants are enforced in two steps. The
+route layer applies a coarse floor per HTTP method: a read needs
+`read`, anything else needs at least one of `create`, `update` or
+`delete`, so a read-only principal never reaches a mutating handler.
+Each mutating handler then authorizes its **complete write set** before
+its first side effect: every config path the mutation will persist,
+classified by what it does to the configuration (`create` for a path it
+brings into being, `delete` for one it removes, `update` otherwise) and
+matched against the profile's `config_write_paths` selectors. The
+classification follows the operation, not the method: creating a map
+key through `POST /api/config/map-key`, or implicitly through a `PUT`
+under a new alias, needs `create`; a JSON Patch `remove` and
+`DELETE /api/config/map-key` need `delete`; a rename needs `delete` on
+its source and `create` on its destination; the references a delete or
+rename cascade rewrites elsewhere are part of the write set too. One
+unauthorized member refuses the whole mutation, batch or cascade, and
+nothing is written. Operations whose write set cannot be enumerated up
+front (a schema migration of the file, a Quickstart apply) require the
+`*` selector. The persist boundary re-checks the paths about to be
+written against what the handler authorized, so a handler cannot
+persist more than it authorized.
+
+Policy moves only at that persist boundary: the handler that writes a
+configuration publishes the authorization state compiled from it as
+the next accepted revision, and every request is verified and resolved
+against the accepted snapshot as it stands. Nothing on the request
+path recompiles policy, so a request that read the configuration
+before a concurrent persist can never reinstall the older policy over
+the newer one; a persisted change to a provider's verification
+settings, a roster or a profile takes effect on the next request. The
+daemon's own RPC surface holds a separate live configuration and
+reaches the same state through the reload the gateway write flags.
+Other gateway surfaces keep the pairing check per handler and adopt the
+layer in follow-ups.
+
 ## Credential lifecycle
 
 - **Expiry** ends the connection's authorization at the deadline; the
@@ -326,19 +543,117 @@ session they were raised for. Sessions created before this change (or by
 unscoped connections) carry no owner: they stay fully visible to unscoped
 connections and invisible to scoped principals.
 
-Memory operations are fail-closed for scoped principals in the interim:
-queries must be scoped to an owned session, and bare-key or cross-session
-memory access stays unscoped-only until principal-owned memory storage
-lands.
+Every authenticated principal gets PRIVATE memory: their memory operations
+read and write a per-principal plane whose owner travels in every storage
+statement, composed with the agent, namespace and tenant dimensions (the
+same key under two agents is two rows). The plane follows the principal's
+identity, not the admin bypass: a named administrator's memory is their
+own private plane, so promoting or demoting a user never hides their notes
+or redirects their writes. Only the unauthenticated shared operator is on
+the shared plane by default; a caller with the admin bypass may name
+`plane = "shared"` on a `memory/*` request explicitly, which is audited,
+and a scoped principal cannot.
+
+The two planes are untouchable from each other in both directions: a
+shared write can neither name a private row's storage key nor overwrite a
+private row, a private write never converts a shared row, ordinary exports
+and the markdown snapshot carry shared rows only, and the legacy bulk
+purges reach shared rows only. Private rows are exported and purged
+through owner-carrying operations.
+
+A session created by a principal has its memory handle pinned to that
+principal's private plane for the session's whole life, whoever prompts it
+later (an administrator restoring a reaped session restores it on the
+durable owner's plane), so the memory tools and per-turn recall inside a
+scoped session never touch the shared plane. There is no grant that opens
+the shared plane to a scoped session. Private writes pass the same content
+scanning and policy gates as shared writes, and private operations are
+audited with the full scope when memory auditing is enabled. On memory
+backends without principal support
+(markdown, lucid, postgres, qdrant today) private memory fails closed with a
+clear denial rather than silently un-scoping, which for a scoped session
+means its memory tools refuse.
+
+## Migrating from [security.nevis]
+
+The Nevis IAM integration was removed. It was never wired into any
+authentication path, so enabling it never authenticated anyone; retiring
+it changes no live behavior. Its config table is still accepted so an old
+`config.toml` keeps loading: the daemon discards every value in the table
+at load, logs one warning naming the replacement, and removes the table
+from `config.toml` on the next save, whether a full save or the
+incremental save the CLI, dashboard and RPC use for a single edit. The
+removal touches only that table; comments and other sections keep their
+bytes. Nothing is converted automatically: the replacement stack needs
+values (an audience, profile grants) the old table never held.
+
+**Before you upgrade**, copy `config.toml` somewhere protected. Every save
+after the upgrade writes `config.toml.bak` next to the file for the
+duration of the write and removes it once the write is durable, so a
+`.bak` is not a lasting backup. Any copy you keep yourself still carries
+the retired table, including a plaintext `client_secret` if one was
+configured, so treat those copies as secret material and revoke the
+Nevis client credential at the IdP once you no longer need it.
+
+Field by field:
+
+| `[security.nevis]` field | Replacement | Notes |
+|---|---|---|
+| `enabled` | none | Presence of an `[oidc.<alias>]` entry is what enables verification. |
+| `instance_url`, `realm` | `[oidc.<alias>] issuer` | The exact issuer URL the IdP advertises in its discovery document; the daemon refuses a discovery document whose `issuer` differs. |
+| `client_id` | `[oidc.<alias>] client_id` | Also used to build the `interactive_clients` / `service_clients` lists that classify who is signing in. |
+| `client_secret` | `[oidc.<alias>] client_secret` | Encrypted on disk through the secret store when `[secrets] encrypt` is on. Required for `validation = "introspection"` and for `client_credentials` service sign-ins. Not copied over from the old table: set it again. |
+| `token_validation = "local"` | `validation = "jwks"` | The JWKS URI comes from the issuer's discovery document. |
+| `token_validation = "remote"` | `validation = "introspection"` | Confidential client required. |
+| `jwks_url` | not supported | There is no custom JWKS override: the key-set URI must be advertised as `jwks_uri` by the configured issuer’s discovery document. That URI may point to a different endpoint; an unadvertised key-set URI cannot be configured. |
+| (none) | `[oidc.<alias>] audience` | **Required, and new.** The `aud` the IdP puts in access tokens for this daemon; there was no equivalent to carry over. |
+| `role_mapping[].nevis_role` | `[oidc.<alias>] claim_path` + `profile_map` | `claim_path` names the claim that carries the role (e.g. `groups`); each `profile_map` key is a claim value, each value a `[permission_profiles.<alias>]` name. Matching is exact, not case-insensitive as before. |
+| `role_mapping[].zeroclaw_permissions` (tool names, or `"all"`) | `[permission_profiles.<alias>] allowed_tools` + `grants.tools = ["execute"]` | Profiles are deny-by-default: `allowed_tools` composes with a coarse `tools = ["execute"]` grant, and every other resource class (`sessions`, `config`, `memory`, …) must be granted explicitly. `"all"` is closest to `admin = true`, which is much broader than "all tools" was; prefer listing resource grants. |
+| `role_mapping[].workspace_access` | not equivalent | There is no per-workspace grant. The nearest control is `allowed_agents`, which scopes a profile to agent aliases. |
+| `require_mfa` | `[oidc.<alias>] require_mfa` and/or `required_acr` | |
+| `session_timeout_secs` | `max_auth_lifetime_secs` (JWKS) / `revalidation_secs` (introspection) | |
+
+Validate before you restart, so a typo does not lock everyone out (see
+**Recovery** under *Local connections* for the way back if it does). Two
+routes do that:
+
+- Write the new `[oidc.<alias>]` and `[permission_profiles]` entries
+  through the daemon's RPC config methods (zerocode's config editor). The
+  daemon validates the authorization sections before anything is saved or
+  swapped in, so a dangling `profile_map` target or a missing `audience`
+  is refused with the reason and the previous policy stays in force.
+- If you edit `config.toml` by hand, run
+  `ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login <alias>)"` from the CLI
+  first: it loads the edited file, refuses an `[oidc.<alias>]` entry that
+  does not validate (issuer, audience, validation mode, client fields),
+  and on success performs a real sign-in against the IdP with the
+  configured client, so the issuer, client id and secret are known good
+  before the daemon restarts on them. This checks the entry, not the
+  `profile_map` targets: a `profile_map` value that names no
+  `[permission_profiles]` entry is caught only by the daemon, which then
+  refuses to compile the policy and starts in the deny-all state
+  described under **Recovery**, so check those names by eye before the
+  restart, or use the RPC route.
+
+Remote connections that present no credential are refused throughout;
+neither route opens one.
+
+**Rolling back** is a config-data operation, not a code revert: reverting
+the binary restores the old types, but a table already removed from
+`config.toml` is not restored by anything. Put back the protected copy
+you took before the upgrade (or re-add the table by hand). The schema
+version does not change for this retirement, so a downgraded binary loads
+the restored file without a migration step.
 
 ## What this layer does not do (yet)
 
-Memory records are not yet principal-owned at the storage layer (scoped
-access is fail-closed instead, as above). `sops/runs` and
-`sops/run-detail` return the run history of every procedure to a principal
-holding `Sops:Read`, whichever agents it ran as, unlike cron history.
-Gateway HTTP routes keep their existing pairing checks, and channel
-identities do not resolve into this principal model.
+Consolidation and governance derive shared-plane rows and do not run for
+private sessions, and administrative access into another principal's
+private memory has no surfaced pathway yet (deny-by-default).
+`sops/runs` and `sops/run-detail` return the run history of every
+procedure to a principal holding `Sops:Read`, whichever agents it ran as,
+unlike cron history. Gateway HTTP routes keep their existing pairing
+checks, and channel identities do not resolve into this principal model.
 
 While `security.trust_daemon_uid = true` (the default) and the policy
 compiles, the daemon's own uid on a Unix socket keeps full access, so a

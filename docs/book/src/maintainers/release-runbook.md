@@ -14,7 +14,7 @@ Last verified against the `v0.8.2` release cycle.
 
 ## The process in seven steps
 
-1. [Generate `CHANGELOG-next.md` using the changelog skill](#step-1-generate-changelog-nextmd)
+1. [Generate `CHANGELOG-next.md` using the changelog skill, with the binary size table](#step-1-generate-changelog-nextmd)
 2. [Open and merge a version bump PR](#step-2-bump-and-merge-the-version-pr)
 3. [Dry-run the release workflows locally with `act`](#step-3-dry-run-the-release-workflows-locally-with-act)
 4. [Trigger the `Release Stable` workflow via manual dispatch](#step-4-trigger-the-release)
@@ -59,6 +59,100 @@ gh workflow run discord-release.yml -f release_tag=vX.Y.Z -f dry_run=true
 ```
 
 The composed text appears in the run's job summary.
+
+### Record the binary size change
+
+Before the version bump, measure the release binary of the previous release
+and of current `master`, then paste the `compare` table into
+`CHANGELOG-next.md` as a `## Binary size` section before Contributors, inside
+a `text` code block. `CHANGELOG-next.md` becomes the release body, so the table
+ships with the release. The table reports local builds of the two source
+revisions on one machine. It does not measure the published archives, which
+the release workflow builds per target with its pinned toolchain and target
+flags, so state the measuring target triple next to the table.
+
+`scripts/ci/binary_size_report.sh` runs on Linux or macOS and needs Python 3.11
+or newer. Its `measure` command builds the `zeroclaw` binary of each `zeroclaw`
+policy profile in `dev/ci/dependency-footprint.toml` with the `release` Cargo
+profile. For each policy profile the report records the binary's bytes,
+SHA-256, and path, the target triple, and the resolved features. The report
+also records the `release` Cargo profile settings from `Cargo.toml`, the Cargo
+and rustc versions, the build variables that change code generation
+(`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, the
+target's `RUSTFLAGS` and linker variables, and `ZEROCLAW_BUILD_ID`), the
+source revision with a worktree digest, and the `Cargo.lock` digest.
+
+Measure each side from its own clean checkout on the same machine and user
+account, and keep the reports outside both checkouts, because an untracked
+file inside a checkout marks its next measurement as dirty:
+
+```sh
+git worktree add ../zeroclaw-vPREV vPREV
+./scripts/ci/binary_size_report.sh measure --repo-root ../zeroclaw-vPREV \
+  --profile foundation --profile agent-runtime \
+  --profile root-default --profile standard-distribution \
+  --target-dir ../zeroclaw-vPREV/target-size --output ../size-vPREV.json
+./scripts/ci/binary_size_report.sh measure \
+  --profile foundation --profile agent-runtime \
+  --profile root-default --profile standard-distribution \
+  --target-dir target-size --output ../size-next.json
+./scripts/ci/binary_size_report.sh compare ../size-vPREV.json ../size-next.json \
+  --output ../size-compare.json
+```
+
+These commands measure the four policy profiles that describe what users run:
+`foundation` (`--no-default-features`), `agent-runtime`, `root-default` (the
+Cargo defaults a source build gets), and `standard-distribution` (the feature
+set of the release archives). Without `--profile`, `measure` builds every
+`zeroclaw` policy profile, including `ci-all` and `hardware-probe`, which are
+CI and hardware aggregates rather than shipped builds. Pass `--target <triple>`
+to build for another target. Without it, `measure` resolves the
+`standard-distribution` features for the host triple, so the per-target
+exclusions in `Cargo.toml` apply as they do for that target's release
+archive.
+
+`compare` prints the table, headed by each side's revision and whether it was
+dirty, and writes the JSON result to the file named by `--output`, or to
+stdout without it.
+
+The binary embeds registry source paths under `CARGO_HOME` and a build stamp
+from `git describe` or `ZEROCLAW_BUILD_ID`. The same source measured on
+another machine or user account can therefore produce different bytes, and
+`compare` cannot detect such a pair. Other inputs change the binary without
+being recorded either: C compiler variables such as `CC` and `CFLAGS`, the
+macOS SDK and deployment target, and Cargo settings in a user-level
+`~/.cargo/config.toml`. Measure both sides on the same machine and user
+account, from the same shell environment.
+
+`measure` refuses to start a build when `RUSTC` or `CARGO_BUILD_RUSTC` is set,
+when a `CARGO_PROFILE_RELEASE_*` variable overrides the `release` Cargo
+profile, when a selected policy profile does not build the `zeroclaw`
+package, or when a policy profile's target directory is inside the checkout
+but not ignored by Git. After each build it refuses a binary that Cargo reports
+at a different path than expected, for example when `CARGO_BUILD_TARGET` or a
+`build.target` setting applies without `--target`. `compare` refuses reports
+that differ in Cargo or rustc version, host, target, `release` Cargo profile
+settings, recorded build variables, policy, or set of policy profiles. A policy
+profile whose resolved features or binary path changed between the reports is
+listed as not comparable, with its added and removed features, instead of
+getting a delta.
+
+Each policy profile builds in its own target directory,
+`<target-dir>/<profile-id>`, which repeats the dependency build per policy
+profile. On macOS arm64 these directories took 0.8 GB for `foundation`,
+1.2 GB for `agent-runtime`, 1.4 GB for `root-default`, and 2.5 GB for
+`standard-distribution`. The first build of a policy profile is a full
+fat-LTO release build that takes several minutes; a repeat run on unchanged
+sources finishes without rebuilding. Clean up when the table is in the
+changelog:
+
+```sh
+rm -rf target-size
+git worktree remove ../zeroclaw-vPREV
+```
+
+For the full target matrix, the job summary of the Cross-Platform Build
+workflow lists each binary's bytes and SHA-256.
 
 ---
 
@@ -157,6 +251,8 @@ Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler add
 Two independent Core Team approvals are the default. Toolchain-floor and release changes may be considered under the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) only with its complete evidence and an explicit justification for this normally two-review category. A timeout never clears an unresolved compatibility or release-safety concern. Merge only when required CI is green.
 
 The **Installer Drift** gate in CI fails the PR if a generated surface is out of sync with the spec, so a missed regeneration cannot land. The **Validate Translations Pin** gate resolves the submodule at the pinned commit and validates catalogue format and msgid parity, so a bad pin cannot land either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext) for translation pipeline details.
+
+The **crates.io Package Preflight** gate runs whenever a PR changes `[workspace.package] version` to a stable `X.Y.Z`. It packages every crate in the release set and compiles each one from its own tarball, with no registry token, so a bump whose crates cannot publish cannot merge. Expect it to add about half an hour to the bump PR. It also runs again in the merge queue. If it fails, read the Preflight step first. A packaging or compile error is real and must be fixed in the bump PR. A crates.io API error, an npm install failure, or a runner timeout is infrastructure. Re-run only the failed jobs rather than pushing again. If the outage persists, keep the bump unmerged until required CI is green. The release run independently repeats the same preflight before the GitHub Release.
 
 **Confirm the merge landed correctly:**
 
@@ -415,8 +511,11 @@ re-trigger. Do not try to work around it.
 Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
 
-Approve all three when they appear. Approve `crates-io` only after its tokenless
-package preflight is green:
+Approve all three when they appear. The `github-releases` gate appears only
+after the tokenless crates.io preflight, `Preflight crates.io Workspace`, has
+packaged and compiled every crate. It runs beside the binary builds, so a
+release whose crates cannot publish stops before anything becomes public. The
+later `crates-io` job uploads what that preflight verified without repeating it:
 
 | Environment | Job | What it does |
 |---|---|---|
@@ -442,6 +541,7 @@ Once `publish` completes, confirm:
 [ ] No loose *.bundle, *.attestation.jsonl, or *.intoto.jsonl assets are present
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
 [ ] Prebuilt Docker and generated Docker matrix jobs are green
+[ ] Release notes contain the binary size table from step 1
 ```
 
 `CHANGELOG-next.md` is intentionally left on `master` after the release: the
@@ -507,9 +607,12 @@ Dispatch **Deploy mdBook docs to Pages** from branch **master**, set **mode** to
 `promote-stable`, and set **tag** to the exact final tag, for example `v0.8.5`.
 The default `build` mode retains the normal build behavior.
 
-Promotion updates only `stable-version.txt`, `index.html`, and `versions.json` at
-the site root. It installs no Rust or mdBook tools and preserves every locale,
-the API reference, shared chrome, and retention state. The workflow's existing
+Promotion updates `stable-version.txt`, `index.html`, `versions.json`, and the
+root `llms.txt` / `llms-full.txt` pair at the site root. That pair mirrors the
+promoted release's English copy, and is withdrawn when the release doesn't carry
+both files, so the fixed LLM URLs always describe the release `/` redirects to.
+It installs no Rust or mdBook tools and preserves every locale, the API
+reference, shared chrome, and retention state. The workflow's existing
 `gh-pages` concurrency group serializes both modes; promotion also uses an exact
 push lease so it cannot replace a site changed by another writer.
 
@@ -580,6 +683,13 @@ policy instead.
 **validate failed: version mismatch:** The version bump PR was not merged, or
 you typed the wrong version. Fix the mismatch and re-trigger.
 
+**The crates.io preflight failed:** Nothing was published. The GitHub Release
+waits for this job, and the job holds no registry token. On a dispatched
+release the tag does not exist yet either. Fix the packaging problem on
+`master`, then dispatch Release Stable again for the same version. Run
+`scripts/release/publish-crates.sh` locally first to confirm the fix; without
+`--execute` it only packages and verifies.
+
 **An environment gate timed out:** Re-run only the timed-out job. No need to
 restart the workflow.
 
@@ -597,7 +707,19 @@ deleted. Fix the failing crate at the same release commit, then re-run
 `Pub crates.io` for the same tag with `dry_run: false`; the publisher queries
 every `<crate>@<version>` first and skips versions that already landed. Read the
 Publish step for the last successful crate. If preflight failed, no upload was
-attempted and the problem is still reversible.
+attempted and the problem is still reversible. If the publish job reports that
+`web/dist` does not match the bundle preflight verified, or that the tag does
+not resolve to the release commit, nothing was uploaded; dispatch
+`Pub crates.io` again so a fresh preflight rebuilds and re-verifies it.
+
+**The failure is in the publisher scripts, not the crates:** Both v0.8.5
+failures were of this kind. Do not move the tag and do not publish by hand. Fix
+the script on `master`, then dispatch `Pub crates.io` from `master` for the same
+tag. The crates are still packaged from the tag, but the scripts under
+`scripts/release/` come from `master`. The run summary shows both commits as
+`commit` and `release tooling`. The resolver accepts newer tooling only from a
+`master` commit that already contains the release commit, and only on a manual
+dispatch. A release run always uses the scripts it was tagged with.
 
 **The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
 A permissions problem, not a manifest problem: the bucket token is dead or
