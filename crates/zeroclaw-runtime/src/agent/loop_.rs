@@ -10689,6 +10689,7 @@ mod tests {
                             observer: &observer,
                             silent: true,
                             approval: None,
+                            security: None,
                             multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(
                             ),
                             config: None,
